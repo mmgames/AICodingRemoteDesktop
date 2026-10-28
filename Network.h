@@ -11,8 +11,9 @@
 
 #pragma comment (lib, "Ws2_32.lib")
 #pragma comment (lib, "Crypt32.lib")
+#pragma comment (lib, "Advapi32.lib")
 
-#define DEFAULT_BUFLEN 512
+#define DEFAULT_BUFLEN 1024
 
 class HTTPServer {
 private:
@@ -60,9 +61,31 @@ private:
 
     img.addEventListener('contextmenu', e => e.preventDefault());
     
-    function sendInput(type, x, y, button) {
+    // Low-latency WebSocket connection for inputs
+    let ws = null;
+    function connectWebSocket() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.onclose = () => {
+            setTimeout(connectWebSocket, 1000); // Auto reconnect
+        };
+        ws.onerror = () => {
+            if (ws) ws.close();
+        };
+    }
+    connectWebSocket();
+
+    function sendInput(type, x, y, button, extra) {
         if (!img.complete) return;
-        fetch(`/input?type=${type}&x=${x}&y=${y}&btn=${button}`, {method: 'POST'});
+        let q = `type=${type}&x=${x}&y=${y}&btn=${button}`;
+        if (extra) q += `&${extra}`;
+        
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(q);
+        } else {
+            // Fallback to HTTP POST if WebSocket is not yet connected
+            fetch(`/input?${q}`, {method: 'POST'});
+        }
     }
 
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || (navigator.userAgent.includes("Mac") && "ontouchend" in document);
@@ -72,11 +95,10 @@ private:
         let lastMove = 0;
         img.addEventListener('mousemove', e => {
             const now = Date.now();
-            if (now - lastMove < 30) return; // Throttle
+            if (now - lastMove < 10) return; // High responsiveness (up to ~100Hz)
             lastMove = now;
             
             const rect = img.getBoundingClientRect();
-            // Calculate normalized coordinates (0.0 to 1.0)
             let nx = (e.clientX - rect.left) / rect.width;
             let ny = (e.clientY - rect.top) / rect.height;
             sendInput('move', nx, ny, 0);
@@ -98,19 +120,17 @@ private:
 
         img.addEventListener('wheel', e => {
             e.preventDefault();
-            // Windows WHEEL_DELTA is 120. Invert deltaY for correct direction.
-            // Scale multiplier can be adjusted if too slow/fast.
             let amount = -e.deltaY; 
-            fetch(`/input?type=wheel&amount=${amount}&x=0&y=0&btn=0`, {method: 'POST'});
+            sendInput('wheel', 0, 0, 0, `amount=${amount}`);
         }, {passive: false});
 
         document.addEventListener('keydown', e => {
             e.preventDefault();
-            fetch(`/input?type=keydown&key=${e.keyCode}&x=0&y=0&btn=0`, {method: 'POST'});
+            sendInput('keydown', 0, 0, 0, `key=${e.keyCode}`);
         });
         document.addEventListener('keyup', e => {
             e.preventDefault();
-            fetch(`/input?type=keyup&key=${e.keyCode}&x=0&y=0&btn=0`, {method: 'POST'});
+            sendInput('keyup', 0, 0, 0, `key=${e.keyCode}`);
         });
     } else {
         // Mobile Mode (Trackpad Relative Position)
@@ -119,7 +139,7 @@ private:
         let touchStartTime = 0;
         let lastMove = 0;
         let hasMoved = false;
-        let touchCount = 0; // distinct from e.touches.length to some extent
+        let touchCount = 0;
 
         img.addEventListener('touchstart', e => {
             e.preventDefault();
@@ -130,18 +150,17 @@ private:
                 touchStartTime = Date.now();
                 hasMoved = false;
             } else if (touchCount === 2) {
-                // Prepare for 2-finger tap check
                 touchStartTime = Date.now();
                 hasMoved = false; 
             }
         }, {passive: false});
 
         img.addEventListener('touchmove', e => {
-            e.preventDefault(); // Prevent scrolling
+            e.preventDefault();
 
             if (e.touches.length === 1) {
                 const now = Date.now();
-                if (now - lastMove < 15) return; 
+                if (now - lastMove < 8) return; // High responsiveness for touch (up to 120Hz)
                 lastMove = now;
 
                 const curX = e.touches[0].clientX;
@@ -157,33 +176,29 @@ private:
                 }
 
                 if (Math.abs(dx) > 0 || Math.abs(dy) > 0) {
-                    fetch(`/input?type=moveRel&x=${dx * sensitivity}&y=${dy * sensitivity}&btn=0`, {method: 'POST'});
+                    sendInput('moveRel', dx * sensitivity, dy * sensitivity, 0);
                 }
                 
                 lastTouchX = curX;
                 lastTouchY = curY;
             } else if (e.touches.length === 2) {
-                // If moving with 2 fingers, cancel tap
                 hasMoved = true;
             }
         }, {passive: false});
 
         img.addEventListener('touchend', e => {
-             // e.touches is remaining touches. Check original intention via touchCount
             const duration = Date.now() - touchStartTime;
             
             if (!hasMoved && duration < 300) {
                  if (touchCount === 1) {
-                     fetch(`/input?type=tap&x=0&y=0&btn=0`, {method: 'POST'});
+                     sendInput('tap', 0, 0, 0);
                  } else if (touchCount === 2) {
-                     fetch(`/input?type=tap&x=0&y=0&btn=2`, {method: 'POST'});
+                     sendInput('tap', 0, 0, 2);
                  }
             }
-            touchCount = e.touches.length; // Update count
+            touchCount = e.touches.length;
         });
     }
-
-    // Keyboard support can be added similarly
 </script>
 </body>
 </html>
@@ -192,7 +207,7 @@ private:
 	std::vector<std::string> connectedClients;
     std::mutex clientListMutex;
 
-    bool CheckAuth(std::string request) {
+    bool CheckAuth(const std::string& request) {
         if (password.empty()) return true;
 
         std::string authPrefix = "Authorization: Basic ";
@@ -219,6 +234,104 @@ private:
         return pass == password;
     }
 
+    // Compute RFC 6455 Sec-WebSocket-Accept key using Windows Crypto API
+    static std::string ComputeWebSocketAccept(const std::string& clientKey) {
+        std::string combined = clientKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        
+        HCRYPTPROV hProv = 0;
+        HCRYPTHASH hHash = 0;
+        BYTE sha1Hash[20];
+        DWORD hashLen = sizeof(sha1Hash);
+
+        if (CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            if (CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
+                CryptHashData(hHash, (const BYTE*)combined.data(), (DWORD)combined.size(), 0);
+                CryptGetHashParam(hHash, HP_HASHVAL, sha1Hash, &hashLen, 0);
+                CryptDestroyHash(hHash);
+            }
+            CryptReleaseContext(hProv, 0);
+        }
+
+        DWORD base64Len = 0;
+        CryptBinaryToStringA(sha1Hash, hashLen, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &base64Len);
+        std::string acceptKey(base64Len, '\0');
+        CryptBinaryToStringA(sha1Hash, hashLen, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &acceptKey[0], &base64Len);
+        while (!acceptKey.empty() && (acceptKey.back() == '\0' || acceptKey.back() == '\r' || acceptKey.back() == '\n')) {
+            acceptKey.pop_back();
+        }
+        return acceptKey;
+    }
+
+    static bool RecvExact(SOCKET sock, char* buf, int len) {
+        int total = 0;
+        while (total < len) {
+            int r = recv(sock, buf + total, len - total, 0);
+            if (r <= 0) return false;
+            total += r;
+        }
+        return true;
+    }
+
+    // Handles incoming WebSocket frames on a single persistent thread
+    void HandleWebSocket(SOCKET ClientSocket) {
+        // Enable TCP_NODELAY
+        int nodelayFlag = 1;
+        setsockopt(ClientSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelayFlag, sizeof(nodelayFlag));
+
+        while (running) {
+            char header[2];
+            if (!RecvExact(ClientSocket, header, 2)) break;
+
+            uint8_t b0 = (uint8_t)header[0];
+            uint8_t b1 = (uint8_t)header[1];
+            uint8_t opcode = b0 & 0x0F;
+            bool masked = (b1 & 0x80) != 0;
+            uint64_t payloadLen = b1 & 0x7F;
+
+            if (opcode == 0x8) { // Close connection
+                break;
+            }
+
+            if (payloadLen == 126) {
+                uint16_t extLen = 0;
+                if (!RecvExact(ClientSocket, (char*)&extLen, 2)) break;
+                payloadLen = ntohs(extLen);
+            } else if (payloadLen == 127) {
+                uint64_t extLen = 0;
+                if (!RecvExact(ClientSocket, (char*)&extLen, 8)) break;
+                payloadLen = _byteswap_uint64(extLen);
+            }
+
+            uint8_t mask[4] = { 0 };
+            if (masked) {
+                if (!RecvExact(ClientSocket, (char*)mask, 4)) break;
+            }
+
+            if (payloadLen > 1024 * 64) {
+                // Input commands never exceed 64KB
+                break;
+            }
+
+            std::string payload((size_t)payloadLen, '\0');
+            if (payloadLen > 0) {
+                if (!RecvExact(ClientSocket, &payload[0], (int)payloadLen)) break;
+                if (masked) {
+                    for (size_t i = 0; i < payloadLen; ++i) {
+                        payload[i] ^= mask[i % 4];
+                    }
+                }
+            }
+
+            if (opcode == 0x9) { // Ping -> send Pong
+                char pong[2] = { (char)0x8A, 0x00 };
+                send(ClientSocket, pong, 2, 0);
+            } else if (opcode == 0x1 || opcode == 0x2) { // Text or Binary payload
+                ProcessInput(payload);
+            }
+        }
+        closesocket(ClientSocket);
+    }
+
 	void HandleClient(SOCKET ClientSocket, std::string clientIP) {
         {
             std::lock_guard<std::mutex> lock(clientListMutex);
@@ -229,8 +342,9 @@ private:
 		int iResult;
 
 		// Read request (basic)
-		iResult = recv(ClientSocket, recvbuf, DEFAULT_BUFLEN, 0);
+		iResult = recv(ClientSocket, recvbuf, DEFAULT_BUFLEN - 1, 0);
 		if (iResult > 0) {
+            recvbuf[iResult] = '\0';
 			std::string request(recvbuf, iResult);
             
             if (!CheckAuth(request)) {
@@ -246,6 +360,35 @@ private:
                 return;
             }
 
+            // WebSocket Upgrade Request
+            if (request.find("Upgrade: websocket") != std::string::npos || request.find("GET /ws") != std::string::npos) {
+                std::string keyHeader = "Sec-WebSocket-Key: ";
+                size_t kPos = request.find(keyHeader);
+                if (kPos != std::string::npos) {
+                    size_t start = kPos + keyHeader.length();
+                    size_t end = request.find("\r\n", start);
+                    std::string clientKey = request.substr(start, end - start);
+                    std::string acceptKey = ComputeWebSocketAccept(clientKey);
+
+                    std::string response = 
+                        "HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
+                    send(ClientSocket, response.c_str(), (int)response.length(), 0);
+
+                    // Transition to persistent WebSocket loop (reusing this thread)
+                    HandleWebSocket(ClientSocket);
+
+                    {
+                        std::lock_guard<std::mutex> lock(clientListMutex);
+                        auto it = std::find(connectedClients.begin(), connectedClients.end(), clientIP);
+                        if (it != connectedClients.end()) connectedClients.erase(it);
+                    }
+                    return;
+                }
+            }
+
 			if (request.find("GET / ") != std::string::npos || request.find("GET /index.html") != std::string::npos) {
 				// Send HTML
 				std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "
@@ -258,9 +401,11 @@ private:
 				std::string header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=boundary\r\n\r\n";
 				send(ClientSocket, header.c_str(), (int)header.length(), 0);
 
-                // Enable TCP_NODELAY for lowest latency
+                // Enable TCP_NODELAY and expand send buffer to 2MB for lowest streaming latency
                 int nodelayFlag = 1;
                 setsockopt(ClientSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelayFlag, sizeof(nodelayFlag));
+                int sndBufSize = 2 * 1024 * 1024;
+                setsockopt(ClientSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&sndBufSize, sizeof(sndBufSize));
 
                 // Wait 1 seconds before starting stream to let connection stabilize
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -268,6 +413,7 @@ private:
                 std::vector<BYTE> imgData;
                 imgData.reserve(512 * 1024); // Pre-allocate to prevent repeated reallocations
                 uint64_t clientSequence = 0; // Sequence number tracked individually per client connection
+                char crlf[] = "\r\n";
 
                 while (running) {
                     // Fully event-driven: blocks until a new frame arrives or 1000ms timeout
@@ -276,16 +422,23 @@ private:
                         std::string chunkHeader = "--boundary\r\nContent-Type: " + contentType + "\r\nContent-Length: "
                             + std::to_string(imgData.size()) + "\r\n\r\n";
 
-                        if (send(ClientSocket, chunkHeader.c_str(), (int)chunkHeader.length(), 0) == SOCKET_ERROR) break;
-                        if (send(ClientSocket, (const char*)imgData.data(), (int)imgData.size(), 0) == SOCKET_ERROR) break;
-                        if (send(ClientSocket, "\r\n", 2, 0) == SOCKET_ERROR) break;
+                        // Single scatter/gather WSASend call to combine header + data + CRLF into one packet
+                        WSABUF bufs[3];
+                        bufs[0].buf = (char*)chunkHeader.data();
+                        bufs[0].len = (ULONG)chunkHeader.size();
+                        bufs[1].buf = (char*)imgData.data();
+                        bufs[1].len = (ULONG)imgData.size();
+                        bufs[2].buf = crlf;
+                        bufs[2].len = 2;
+
+                        DWORD bytesSent = 0;
+                        if (WSASend(ClientSocket, bufs, 3, &bytesSent, 0, NULL, NULL) == SOCKET_ERROR) break;
                     }
                 }
                 closesocket(ClientSocket);
 			}
 			else if (request.find("POST /input") != std::string::npos || request.find("GET /input") != std::string::npos) {
-				// Parse Input
-				// Query string parsing simplified
+				// Parse Input (HTTP fallback)
 				size_t qPos = request.find("?");
 				size_t endPos = request.find(" HTTP");
 				if (qPos != std::string::npos && endPos != std::string::npos) {
@@ -315,26 +468,21 @@ private:
         }
 	}
 
-	void ProcessInput(std::string query) {
-		// query format: type=move&x=0.5&y=0.5&btn=0
+	void ProcessInput(const std::string& query) {
+		// query format: type=move&x=0.5&y=0.5&btn=0&key=13&amount=120
 		std::string type;
 		float x = 0, y = 0;
 		int btn = 0;
         int amount = 0;
+        int key = 0;
 
-		// Very basic parsing
 		size_t p;
 		if ((p = query.find("type=")) != std::string::npos) type = query.substr(p + 5, query.find("&", p) - p - 5);
 		if ((p = query.find("x=")) != std::string::npos) x = std::stof(query.substr(p + 2, query.find("&", p) - p - 2));
 		if ((p = query.find("y=")) != std::string::npos) y = std::stof(query.substr(p + 2, query.find("&", p) - p - 2));
-		if ((p = query.find("btn=")) != std::string::npos) btn = std::stoi(query.substr(p + 4));
-		if ((p = query.find("btn=")) != std::string::npos) btn = std::stoi(query.substr(p + 4));
-        if ((p = query.find("amount=")) != std::string::npos) amount = std::stoi(query.substr(p + 7));
-        int key = 0;
-        if ((p = query.find("key=")) != std::string::npos) key = std::stoi(query.substr(p + 4));
-
-		int screenW = GetSystemMetrics(SM_CXSCREEN);
-		int screenH = GetSystemMetrics(SM_CYSCREEN);
+		if ((p = query.find("btn=")) != std::string::npos) btn = std::stoi(query.substr(p + 4, query.find("&", p) - p - 4));
+        if ((p = query.find("amount=")) != std::string::npos) amount = std::stoi(query.substr(p + 7, query.find("&", p) - p - 7));
+        if ((p = query.find("key=")) != std::string::npos) key = std::stoi(query.substr(p + 4, query.find("&", p) - p - 4));
 
 		INPUT input = { 0 };
 		input.type = INPUT_MOUSE;

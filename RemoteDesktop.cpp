@@ -1,4 +1,4 @@
-﻿// RemoteDesktop.cpp : アプリケーションのエントリ ポイントを定義します。
+// RemoteDesktop.cpp : アプリケーションのエントリ ポイントを定義します。
 //
 
 #include "framework.h"
@@ -44,14 +44,22 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         scale = 1.0f;
     }
 
+    auto WStringToUtf8 = [](const wchar_t* wstr) -> std::string {
+        if (!wstr || !*wstr) return "";
+        int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+        if (len <= 1) return "";
+        std::string s(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &s[0], len, NULL, NULL);
+        return s;
+    };
+
     // Parse Command Line
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
         for (int i = 1; i < argc; ++i) {
             if (wcscmp(argv[i], L"-port") == 0 && i + 1 < argc) {
-                std::wstring ws(argv[++i]);
-                port = std::string(ws.begin(), ws.end());
+                port = WStringToUtf8(argv[++i]);
             }
             else if (wcscmp(argv[i], L"-scale") == 0 && i + 1 < argc) {
                 scale = (float)_wtof(argv[++i]);
@@ -64,8 +72,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                 if (quality > 1.0f) quality = 1.0f;
             }
             else if (wcscmp(argv[i], L"-password") == 0 && i + 1 < argc) {
-                std::wstring ws(argv[++i]);
-                password = std::string(ws.begin(), ws.end());
+                password = WStringToUtf8(argv[++i]);
             }
             else if (wcscmp(argv[i], L"-bmp") == 0) {
                 useBmp = true;

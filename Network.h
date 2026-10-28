@@ -258,22 +258,28 @@ private:
 				std::string header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=boundary\r\n\r\n";
 				send(ClientSocket, header.c_str(), (int)header.length(), 0);
 
+                // Enable TCP_NODELAY for lowest latency
+                int nodelayFlag = 1;
+                setsockopt(ClientSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelayFlag, sizeof(nodelayFlag));
+
                 // Wait 1 seconds before starting stream to let connection stabilize
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
-				while (running) {
-					std::vector<BYTE> imgData;
-					if (capturer.CaptureScreen(imgData)) {
-                        std::string contentType = useBmp ? "image/bmp" : "image/jpeg";
-						std::string chunkHeader = "--boundary\r\nContent-Type: " + contentType + "\r\nContent-Length: "
-							+ std::to_string(imgData.size()) + "\r\n\r\n";
+                std::vector<BYTE> imgData;
+                imgData.reserve(512 * 1024); // Pre-allocate to prevent repeated reallocations
 
-						if (send(ClientSocket, chunkHeader.c_str(), (int)chunkHeader.length(), 0) == SOCKET_ERROR) break;
-						if (send(ClientSocket, (const char*)imgData.data(), (int)imgData.size(), 0) == SOCKET_ERROR) break;
-						if (send(ClientSocket, "\r\n", 2, 0) == SOCKET_ERROR) break;
-					}
-				}
-				closesocket(ClientSocket);
+                while (running) {
+                    if (capturer.CaptureScreen(imgData, 100)) {
+                        std::string contentType = useBmp ? "image/bmp" : "image/jpeg";
+                        std::string chunkHeader = "--boundary\r\nContent-Type: " + contentType + "\r\nContent-Length: "
+                            + std::to_string(imgData.size()) + "\r\n\r\n";
+
+                        if (send(ClientSocket, chunkHeader.c_str(), (int)chunkHeader.length(), 0) == SOCKET_ERROR) break;
+                        if (send(ClientSocket, (const char*)imgData.data(), (int)imgData.size(), 0) == SOCKET_ERROR) break;
+                        if (send(ClientSocket, "\r\n", 2, 0) == SOCKET_ERROR) break;
+                    }
+                }
+                closesocket(ClientSocket);
 			}
 			else if (request.find("POST /input") != std::string::npos || request.find("GET /input") != std::string::npos) {
 				// Parse Input

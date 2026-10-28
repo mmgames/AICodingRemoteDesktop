@@ -267,9 +267,11 @@ private:
 
                 std::vector<BYTE> imgData;
                 imgData.reserve(512 * 1024); // Pre-allocate to prevent repeated reallocations
+                uint64_t clientSequence = 0; // Sequence number tracked individually per client connection
 
                 while (running) {
-                    if (capturer.CaptureScreen(imgData, 100)) {
+                    // Fully event-driven: blocks until a new frame arrives or 1000ms timeout
+                    if (capturer.GetFrame(imgData, clientSequence, 1000)) {
                         std::string contentType = useBmp ? "image/bmp" : "image/jpeg";
                         std::string chunkHeader = "--boundary\r\nContent-Type: " + contentType + "\r\nContent-Length: "
                             + std::to_string(imgData.size()) + "\r\n\r\n";

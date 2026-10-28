@@ -177,9 +177,13 @@ private:
     UINT currentStagingWidth = 0;
     UINT currentStagingHeight = 0;
 
+    // Frame synchronization & Cache
     std::mutex mutex;
     std::condition_variable frameCv;
-    std::atomic<bool> hasNewFrame{ false };
+    uint64_t frameSequence = 0;          // Incremented on every new frame from capture API
+    uint64_t lastEncodedSequence = 0;    // Sequence number of current cachedEncodedData
+    std::vector<BYTE> cachedEncodedData; // Cached encoded frame shared across clients
+    std::atomic<bool> isRunning{ false };
 
     // Performance
     std::atomic<long long> lastCaptureDuration{ 0 };
@@ -287,79 +291,15 @@ private:
 
             // Copy GPU to GPU
             d3dContext->CopyResource(latestTexture.get(), texture.get());
-            hasNewFrame = true;
+            frameSequence++;
         }
         frameCv.notify_all();
     }
 
-public:
-    ScreenCapturer() {
-        // Constructor is empty to be safe for global instantiation
-    }
-
-    ~ScreenCapturer() {
-        Stop();
-    }
-
-    void SetConfiguration(float scale, float quality, bool bmp, bool gray) {
-        scaleFactor = scale;
-        jpegQuality = quality;
-        useBmp = bmp;
-        useGray = gray;
-    }
-
-    void Start() {
-        if (winrtDevice) return; // Already started
-
-        // Init WinRT, D3D, WIC
-        InitD3D();
-        InitWIC();
-        StartCapture();
-    }
-
-    void Stop() {
-        if (session) {
-            session.Close();
-            session = nullptr;
-        }
-        if (framePool) {
-            framePool.Close();
-            framePool = nullptr;
-        }
-        item = nullptr;
-        winrtDevice = nullptr;
-        latestTexture = nullptr;
-        latestSrv = nullptr;
-        scaledTexture = nullptr;
-        scaledRtv = nullptr;
-        stagingTexture = nullptr;
-        scaleVertexShader = nullptr;
-        scalePixelShader = nullptr;
-        scaleGrayPixelShader = nullptr;
-        linearSampler = nullptr;
-        d3dDevice = nullptr;
-        d3dContext = nullptr;
-        wicFactory = nullptr;
-        hasNewFrame = false;
-        frameCv.notify_all();
-    }
-
-    long long GetLastDuration() {
-        return lastCaptureDuration;
-    }
-
-    bool CaptureScreen(std::vector<BYTE>& buffer, int timeoutMs = 100) {
-        if (!winrtDevice) Start();
-
-        std::unique_lock<std::mutex> lock(mutex);
-        if (!hasNewFrame) {
-            frameCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
-                return hasNewFrame.load();
-            });
-        }
-        if (!hasNewFrame || !latestTexture) return false;
-
-        hasNewFrame = false; // Mark frame as consumed
+    // Encodes the currently captured frame and stores it in cachedEncodedData.
+    // Must be called with 'mutex' locked.
+    void EncodeLatestFrameLocked() {
+        if (!latestTexture) return;
 
         auto start = std::chrono::high_resolution_clock::now();
 
@@ -450,8 +390,8 @@ public:
         D3D11_MAPPED_SUBRESOURCE mapInfo;
         check_hresult(d3dContext->Map(stagingTexture.get(), 0, D3D11_MAP_READ, 0, &mapInfo));
 
-        // Zero-copy encode directly into destination buffer
-        memStream.Attach(&buffer);
+        // Zero-copy encode directly into cachedEncodedData
+        memStream.Attach(&cachedEncodedData);
 
         GUID format = useBmp ? GUID_ContainerFormatBmp : GUID_ContainerFormatJpeg;
         winrt::com_ptr<IWICBitmapEncoder> encoder;
@@ -498,9 +438,112 @@ public:
 
         d3dContext->Unmap(stagingTexture.get(), 0);
 
+        lastEncodedSequence = frameSequence;
+
         auto end = std::chrono::high_resolution_clock::now();
         lastCaptureDuration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    }
 
+public:
+    ScreenCapturer() {
+        // Constructor is empty to be safe for global instantiation
+    }
+
+    ~ScreenCapturer() {
+        Stop();
+    }
+
+    void SetConfiguration(float scale, float quality, bool bmp, bool gray) {
+        scaleFactor = scale;
+        jpegQuality = quality;
+        useBmp = bmp;
+        useGray = gray;
+    }
+
+    void Start() {
+        if (winrtDevice) return; // Already started
+        isRunning = true;
+
+        // Init WinRT, D3D, WIC
+        InitD3D();
+        InitWIC();
+        StartCapture();
+    }
+
+    void Stop() {
+        isRunning = false;
+        frameCv.notify_all();
+
+        if (session) {
+            session.Close();
+            session = nullptr;
+        }
+        if (framePool) {
+            framePool.Close();
+            framePool = nullptr;
+        }
+        item = nullptr;
+        winrtDevice = nullptr;
+        latestTexture = nullptr;
+        latestSrv = nullptr;
+        scaledTexture = nullptr;
+        scaledRtv = nullptr;
+        stagingTexture = nullptr;
+        scaleVertexShader = nullptr;
+        scalePixelShader = nullptr;
+        scaleGrayPixelShader = nullptr;
+        linearSampler = nullptr;
+        d3dDevice = nullptr;
+        d3dContext = nullptr;
+        wicFactory = nullptr;
+        frameSequence = 0;
+        lastEncodedSequence = 0;
+        cachedEncodedData.clear();
+    }
+
+    long long GetLastDuration() {
+        return lastCaptureDuration;
+    }
+
+    // Fully event-driven frame retrieval with sequence tracking and shared encoding cache.
+    // Prevents busy-waiting and duplicate encoding across single or multiple clients.
+    bool GetFrame(std::vector<BYTE>& buffer, uint64_t& clientSequence, int timeoutMs = 1000) {
+        if (!winrtDevice) Start();
+
+        std::unique_lock<std::mutex> lock(mutex);
+
+        // Immediate delivery for newly connected client (clientSequence == 0) if a frame already exists
+        if (clientSequence == 0 && frameSequence > 0) {
+            if (lastEncodedSequence != frameSequence || cachedEncodedData.empty()) {
+                EncodeLatestFrameLocked();
+            }
+            buffer = cachedEncodedData;
+            clientSequence = frameSequence;
+            return true;
+        }
+
+        // Wait for a newer frame than the client's current sequence
+        bool arrived = frameCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this, clientSequence] {
+            return !isRunning || frameSequence > clientSequence;
+        });
+
+        if (!isRunning || !arrived || frameSequence <= clientSequence || !latestTexture) {
+            return false;
+        }
+
+        // Encode if this frameSequence hasn't been encoded yet
+        if (lastEncodedSequence != frameSequence || cachedEncodedData.empty()) {
+            EncodeLatestFrameLocked();
+        }
+
+        buffer = cachedEncodedData;
+        clientSequence = frameSequence;
         return true;
+    }
+
+    // Backward-compatible CaptureScreen wrapper
+    bool CaptureScreen(std::vector<BYTE>& buffer, int timeoutMs = 100) {
+        uint64_t seq = 0;
+        return GetFrame(buffer, seq, timeoutMs);
     }
 };
